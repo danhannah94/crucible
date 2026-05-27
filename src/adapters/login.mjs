@@ -90,32 +90,52 @@ export async function captureStorageState({
 
   await snapshotState();
 
+  let sigintListener = null;
   await new Promise((resolve) => {
     let resolved = false;
     const finish = (reason) => {
       if (!resolved) {
         resolved = true;
-        log(`captured (${reason}) — closing browser.`);
+        log(`captured (${reason}) — saving state.`);
         resolve();
       }
     };
     if (installSignalHandler) {
-      process.once('SIGINT', () => finish('SIGINT'));
+      sigintListener = () => finish('SIGINT');
+      // `on`, not `once`: a permanent listener keeps Node from taking the
+      // default-exit path on residual SIGINTs between the awaits below.
+      // Removed explicitly before return.
+      process.on('SIGINT', sigintListener);
     }
     context.on('close', () => finish('context-closed'));
     browser.on('disconnected', () => finish('browser-disconnected'));
   });
 
-  // One last snapshot attempt while context might still be alive.
+  // One last snapshot. After SIGINT, Chromium received the signal too and may
+  // already be tearing down; snapshotState() is wrapped in try/catch and
+  // keeps `lastSnapshot` from the most recent main-frame navigation if this
+  // read fails.
   await snapshotState();
 
-  try { await browser.close(); } catch {}
-
   if (!lastSnapshot) {
+    if (sigintListener) process.off('SIGINT', sigintListener);
     throw new Error('failed to capture storageState — no successful snapshot taken. Try again.');
   }
 
+  // Write before closing the browser. browser.close() can hang indefinitely
+  // after SIGINT because the CDP connection died with Chromium. The state
+  // file is the load-bearing artifact; don't let cleanup block it.
   await writeStorageState(adapter.storageStatePath, lastSnapshot);
   log(`wrote storageState to ${adapter.storageStatePath}`);
+
+  // Best-effort teardown with a short timeout.
+  try {
+    await Promise.race([
+      browser.close(),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]);
+  } catch {}
+
+  if (sigintListener) process.off('SIGINT', sigintListener);
   return adapter.storageStatePath;
 }
