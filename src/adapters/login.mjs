@@ -29,6 +29,17 @@ export const WSL_LAUNCH_ARGS = Object.freeze([
 ]);
 
 /**
+ * Strip Playwright's automation tells for interactive logins. navigator.webdriver
+ * (set via the AutomationControlled blink feature) and the --enable-automation
+ * switch are how identity providers — Google especially — detect a non-human
+ * browser and refuse to authenticate ("This browser or app may not be secure").
+ * A human is driving this login, so removing them is correct, not a hack.
+ */
+export const AUTOMATION_EVASION_ARGS = Object.freeze([
+  '--disable-blink-features=AutomationControlled',
+]);
+
+/**
  * Open a non-headless browser at the adapter's URL and wait for the user to
  * complete login interactively (typically SSO + 2FA). Captures the resulting
  * `storageState` (cookies + localStorage) to disk.
@@ -59,13 +70,34 @@ export async function captureStorageState({
   log(`launching non-headless chromium at ${adapter.url}`);
   log(`complete login in the browser, then press Ctrl+C in this terminal to save.`);
 
-  const launchOpts = { headless: false };
+  // Interactive SSO frequently runs through identity providers (notably Google)
+  // that refuse to authenticate in an automation-controlled browser — the
+  // "This browser or app may not be secure" wall. Two things trip that detector:
+  // Playwright's bundled Chromium (not real Chrome), and the automation tells it
+  // sets by default — navigator.webdriver (the AutomationControlled blink
+  // feature) and the --enable-automation switch. A human-driven login gains
+  // nothing from those, so strip them and prefer the real Chrome channel,
+  // falling back to bundled Chromium when Chrome isn't installed.
+  const launchOpts = {
+    headless: false,
+    args: [...AUTOMATION_EVASION_ARGS],
+    ignoreDefaultArgs: ['--enable-automation'],
+  };
   if (await isWSL()) {
     log('detected WSL — disabling GPU paths to avoid WSLg compositor crashes');
-    launchOpts.args = [...WSL_LAUNCH_ARGS];
+    launchOpts.args.push(...WSL_LAUNCH_ARGS);
   }
 
-  const browser = await launcher.launch(launchOpts);
+  let browser;
+  try {
+    browser = await launcher.launch({ ...launchOpts, channel: 'chrome' });
+    log('launched real Google Chrome (channel=chrome) — best odds past IdP automation blocks');
+  } catch (err) {
+    log(
+      `real Chrome unavailable (${(err.message || '').split('\n')[0]}); falling back to bundled Chromium`,
+    );
+    browser = await launcher.launch(launchOpts);
+  }
   const context = await browser.newContext();
   const page = await context.newPage();
 
